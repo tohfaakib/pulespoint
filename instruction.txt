@@ -1,0 +1,56 @@
+The project contains four files
+1. pulsepoint_scraper.py (core scraping script)
+2. database.ini file (db configuration file)
+3. requirements.txt
+4. cron_run.py file (runner script)
+
+
+for geolocation, add api key
+1. Visit : https://positionstack.com/product and click "sign up" in "Free" section
+2. After registration it will redirect you to - https://positionstack.com/dashboard 
+3. Retrive the key from the dashboard page - "Your API Access Key" section and paste it in "pulsepoint_scraper.py" file line number 130. (check for text "YOUR_API_KEY")
+
+
+
+
+Please execute the "cron_run.py" (tested and advised to run on python 3.7)
+
+The scraping script will run once in every 3 mins along with rotating the Nord VPN IP address
+
+
+
+
+Query to create table in postgres
+
+
+-- Table: public.incidents
+
+-- DROP TABLE public.incidents;
+
+CREATE TABLE public.incidents(
+    type character varying COLLATE pg_catalog."default",
+    title character varying COLLATE pg_catalog."default",
+    agency character varying COLLATE pg_catalog."default",
+    location character varying COLLATE pg_catalog."default",
+    timestamp_time character varying COLLATE pg_catalog."default",
+    date_of_incident date,
+    description character varying COLLATE pg_catalog."default",
+    duration character varying COLLATE pg_catalog."default",
+    incident_logo character varying COLLATE pg_catalog."default",
+    agency_logo character varying COLLATE pg_catalog."default",
+    address character varying COLLATE pg_catalog."default",
+    city character varying COLLATE pg_catalog."default",
+    state character varying COLLATE pg_catalog."default",
+    address_2 character varying COLLATE pg_catalog."default",
+    business character varying COLLATE pg_catalog."default",
+    zip_code character varying COLLATE pg_catalog."default",
+	property_value character varying COLLATE pg_catalog."default",
+    id integer NOT NULL GENERATED ALWAYS AS IDENTITY ( INCREMENT 1 START 1 MINVALUE 1 MAXVALUE 2147483647 CACHE 1 ),
+    CONSTRAINT incidents_pkey PRIMARY KEY (id)
+);
+
+
+TABLESPACE pg_default;
+
+ALTER TABLE public.incidents
+    OWNER to postgres;

@@ -1,0 +1,747 @@
+import concurrent.futures
+import datetime
+import re
+import time
+import timeit
+import urllib
+from configparser import ConfigParser
+from urllib.parse import urljoin
+
+import psycopg2
+import requests
+from bs4 import BeautifulSoup
+from psycopg2.extras import execute_values
+from selenium import webdriver
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementClickInterceptedException, \
+    ElementNotInteractableException
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
+""" set driver args """
+
+chrome_options = Options()
+
+# set chrome driver args
+##chrome_options.add_argument("--headless")
+chrome_options.add_argument("--disable-extensions")
+chrome_options.add_argument("--disable-notifications")
+chrome_options.add_argument("--disable-infobars")
+chrome_options.add_argument("--mute-audio")
+chrome_options.add_argument('--ignore-certificate-errors')
+chrome_options.add_argument("--no-sandbox")
+chrome_options.add_argument('--disable-gpu')
+
+
+""" vars , consts """
+
+# urls
+
+URL_PULSEPOINT = "https://web.pulsepoint.org/"
+
+# download chrome driver and set the path
+# example below
+# CHROME_DRIVER_PATH = "E:\\chromedriver.exe"
+
+CHROME_DRIVER_PATH = "C:/Users/User/Desktop/scraper/chromedriver.exe"
+
+headers = {
+    'authority': 'www.zillow.com',
+    'pragma': 'no-cache',
+    'cache-control': 'no-cache',
+    'dnt': '1',
+    'upgrade-insecure-requests': '1',
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.4389.114 Safari/537.36',
+    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
+    'sec-fetch-site': 'same-origin',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-dest': 'empty',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua': '"Google Chrome";v="89", "Chromium";v="89", ";Not A Brand";v="99"',
+    'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
+    # 'referer':'https://www.google.com/'
+}
+
+
+def config(filename='C:/Users/User/Desktop/scraper/database.ini', section='postgresql'):
+    # create a parser
+    parser = ConfigParser()
+    # read config file
+    parser.read(filename)
+
+    # get section, default to postgresql
+    db = {}
+    if parser.has_section(section):
+        params = parser.items(section)
+        for param in params:
+            db[param[0]] = param[1]
+    else:
+        raise Exception('Section {0} not found in the {1} file'.format(section, filename))
+
+    return db
+
+
+def connect():
+    """ Connect to the PostgreSQL database server """
+    conn, cur_insert, cur_update = None, None, None
+    try:
+        # read connection parameters
+        params = config()
+
+        # connect to the PostgreSQL server
+        print('Connecting to the PostgreSQL database...')
+        conn = psycopg2.connect(**params)
+
+        # create two cursors
+        cur_insert = conn.cursor()
+        cur_update = conn.cursor()
+
+        # execute a statement
+        print('PostgreSQL database version:')
+        cur_insert.execute('SELECT version()')
+
+        # display the PostgreSQL database server version
+        db_version = cur_insert.fetchone()
+        print(db_version)
+
+        # close the communication with the PostgreSQL
+        # cursor.close()
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(error)
+    # finally:
+    #     if connection is not None:
+    #         connection.close()
+    #         print('Database connection closed.')
+    return cur_insert, cur_update, conn
+
+
+def calculate_duration(time_duration):
+    time_duration = time_duration.replace(' ', '')
+    if re.findall(r"(\d+)h", time_duration):
+        duration = int(re.findall(r"(\d+)h", time_duration)[0]) * 60 + int(re.findall(r"(\d+)m", time_duration)[0])
+    else:
+        duration = int(re.findall(r"(\d+)m", time_duration)[0])
+    return duration
+
+
+def sooner_time_stamp_time(time_stamp_db, time_stamp_p):
+    return time_stamp_db if datetime.datetime.strptime(time_stamp_db, '%I:%M %p') > datetime.datetime.strptime(
+        time_stamp_p,
+        '%I:%M %p') else time_stamp_p
+
+
+def get_nominatim_geocode(address):
+    url = 'https://nominatim.openstreetmap.org/search/' + urllib.parse.quote(address) + '?format=json'
+    try:
+        response = requests.get(url).json()
+        return response[0]["lon"], response[0]["lat"]
+    except Exception as e:
+        # print(e)
+        return None, None
+
+
+def get_positionstack_geocode(address):
+    BASE_URL = "http://api.positionstack.com/v1/forward?access_key="
+    # todo add API KEY
+    API_KEY = "3ad07f2ae51a8d7bf9f07d201f262579"
+
+    url = BASE_URL + API_KEY + '&query=' + urllib.parse.quote(address)
+    try:
+        response = requests.get(url).json()
+        # print( response["data"][0])
+        return response["data"][0]["longitude"], response["data"][0]["latitude"]
+    except Exception as e:
+        # print(e)
+        return None, None
+
+
+def get_geocode(address):
+    long, lat = get_nominatim_geocode(address)
+    if long is None:
+        return get_positionstack_geocode(address)
+    else:
+        return long, lat
+
+
+def get_property_value(address):
+    """ sample URL signature: https://www.zillow.com/homes/7520-CHANDLER-AVE,-COUNTRY-CLUB-HILLS,-MO_rb/2673866_zpid/"""
+
+    url = 'https://www.zillow.com/homes/' + urllib.parse.quote(address) + '_rb/'
+    try:
+        response = requests.get(url, headers=headers)
+        # print(response.text)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        zestimate_txt = soup.select("span.sc-pzYib.cVYBFK")[0].text.split()[1].strip()
+        # print(zestimate_txt)
+        if len(soup.select("span.sc-pzYib.cVYBFK")) == 1:
+            print('hello')
+            property_value = soup.select("span.sc-pzYib.cVYBFK")[0].text.split()[1]
+        elif zestimate_txt == 'None':
+            property_value = soup.select("span.sc-pzYib.cVYBFK")[-1].text.split()[-1]
+        elif zestimate_txt == 'on':
+            # print('hello',soup.select("span.sc-pzYib.cVYBFK"))
+            property_value = soup.select("span.sc-pzYib.cVYBFK")[-1].text.split()[-1]
+        else:
+            property_value = zestimate_txt
+
+        if bool(re.search(r'\d', property_value)) == True and '/' not in property_value:
+            return property_value
+        else:
+            return None
+    except Exception as e:
+        return None
+
+
+def get_data_attr(incident_contents, incident_type, cur_insert, cur_update, conn):
+    print(f'length of {incident_type} incidents list ', len(incident_contents))
+    data_contents_insert, data_contents_update = [], []
+    for content in incident_contents:
+        data_attr = dict()
+        data_attr['type'] = incident_type.strip()
+        data_attr['agency'] = content.select_one(
+            'div.pp_incident_item_icon p.pp_wa_incident_list_agency_shortname').text.strip()
+        data_attr['agency_logo'] = urljoin(URL_PULSEPOINT, content.select_one(
+            'div.pp_incident_item_icon img.pp_incident_item_agency_img')['src'])
+        data_attr['incident_logo'] = urljoin(URL_PULSEPOINT, content.select_one(
+            'div.pp_incident_item_icon img.pp_incident_item_icon_img')['src'])
+
+        location = content.select_one(
+            'div.pp_incident_item_description h3.pp_incident_item_description_location').text.strip()
+        data_attr['location'] = str(location.replace('\'', '\'\''))
+        data_attr['address_2'], data_attr['business'] = None, None
+        if '(' in location:
+            data_attr['business'] = re.search(r'\((.*?)\)', location).group(1)
+            location = location.replace(data_attr['business'], '').replace('(', '').replace(')', '')
+        if len(location.split(',')) == 3:
+            data_attr['address'], data_attr['city'], data_attr['state'] = location.split(',')
+        if len(location.split(',')) == 4:
+            data_attr['address'], data_attr['address_2'], data_attr['city'], data_attr['state'] = [loc.strip() for loc
+                                                                                                   in
+                                                                                                   location.split(',')]
+        data_attr['description'] = content.select_one(
+            'div.pp_incident_item_description h6.pp_incident_item_description_units').text.strip()
+        data_attr['title'] = content.select_one(
+            'div.pp_incident_item_description h2.pp_incident_item_description_title').text.strip()
+        incident_day = content.select_one(
+            'div.pp_incident_item_timestamp h5.pp_incident_item_timestamp_day').text.strip()
+        if incident_day.lower() == 'today':
+            data_attr['date_of_incident'] = datetime.datetime.now().date()
+        elif incident_day.lower() == 'yesterday':
+            data_attr['date_of_incident'] = datetime.datetime.now().date() - datetime.timedelta(days=1)
+        else:
+            data_attr['date_of_incident'] = time.strptime(incident_day.strip(), "%m/%d/%Y")
+        data_attr['duration'] = content.select_one(
+            'div.pp_incident_item_timestamp h6.pp_incident_item_call_duration').text.strip()
+        data_attr['timestamp_time'] = content.select_one(
+            'div.pp_incident_item_timestamp h5.pp_incident_item_timestamp_time').text.strip()
+
+        data_attr['longitude'], data_attr['latitude'] = get_geocode(data_attr['address'])
+        data_attr['property_value'] = get_property_value(location.replace(' ', '-'))
+        # pprint(data_attr)
+        location_to_check = data_attr.get('location').replace("\'\'", "\'\'\'\'")
+        query_on_active = f"SELECT id from incidents where type = 'active' and " \
+                          f"location = '{location_to_check}' and agency = '{data_attr.get('agency')}' and " \
+                          f"title = '{data_attr.get('title')}' and " \
+                          f"date_of_incident = '{data_attr.get('date_of_incident').strftime('%Y-%m-%d')}' and " \
+                          f"timestamp_time = '{data_attr.get('timestamp_time')}' and duration = '' "
+
+        query_on_duplicate = f"SELECT id from incidents where type = '{data_attr.get('type')}'  and " \
+                             f"location = '{location_to_check}' and agency = '{data_attr.get('agency')}' and " \
+                             f"title = '{data_attr.get('title')}' and " \
+                             f"date_of_incident = '{data_attr.get('date_of_incident').strftime('%Y-%m-%d')}'"
+
+        query_on_merge_check = f"SELECT * from incidents where type = '{data_attr.get('type')}' and " \
+                               f"location = '{location_to_check}' and " \
+                               f"title = '{data_attr.get('title')}' and " \
+                               f"date_of_incident = '{data_attr.get('date_of_incident').strftime('%Y-%m-%d')}' "
+
+        # print(query_on_merge_check)
+
+        """ check for duplicates"""
+        cur_insert.execute(query_on_duplicate)
+        duplicate_id = list(cur_insert.fetchall())
+        # print("================", len(duplicate_id) > 0, cur_insert.fetchall())
+        if len(duplicate_id) > 0:
+            print("duplicate values", duplicate_id[0][0], " skipping...")
+            continue
+        else:
+            """query to check duplicate to merge"""
+            cur_merge_check = conn.cursor()
+            cur_merge_check.execute(query_on_merge_check)
+            merge_check_element = list(cur_merge_check.fetchall())
+            # print('================ merge_check_element ', merge_check_element)
+            # print('\n', cur_merge_check.fetchall())
+
+            """Query to check for active incident turned to recent"""
+            cur_update.execute(query_on_active)
+            id_to_update = list(cur_update.fetchall())
+            # print('================ id_to_update ', id_to_update)
+
+            """ check for duplicates ready to merge"""
+            if len(merge_check_element) > 0:
+                print("duplicates ready to merge ")
+                final_duration = data_attr['duration'] if calculate_duration(
+                    data_attr['duration']) > calculate_duration(merge_check_element[0][7]) else merge_check_element[0][
+                    7]
+                final_time_stamp_time = sooner_time_stamp_time(data_attr['timestamp_time'], merge_check_element[0][4])
+                # data_tuple_update = (merge_check_element[0][17],
+                #                      data_attr['type'], data_attr['title'], data_attr['agency'], data_attr['location'],
+                #                      final_time_stamp_time,
+                #                      data_attr['date_of_incident'],
+                #                      data_attr['description'] + ' ' + merge_check_element[0][6],
+                #                      final_duration,
+                #                      data_attr['incident_logo'], data_attr['agency_logo'],
+                #                      data_attr['address'], data_attr['city'], data_attr['state'], data_attr['address_2'],
+                #                      data_attr['business'],data_attr['longitude'], data_attr['latitude'])
+
+                agency = data_attr['agency']
+                for elem in data_contents_update:
+                    if (elem[1] == data_attr['title'] and elem[3] == data_attr['location'] and elem[5] == data_attr.get(
+                            'date_of_incident')):
+                        if (elem[2] != agency):
+                            data_attr['agency'] = data_attr['agency'] + "," + elem[2]
+                        else:
+                            continue
+                        break
+                else:
+                    data_contents_update.append((merge_check_element[0][18],
+                                                 data_attr['type'], data_attr['title'],
+                                                 data_attr['agency'] + ',' + merge_check_element[0][2],
+                                                 data_attr['location'],
+                                                 final_time_stamp_time,
+                                                 data_attr['date_of_incident'],
+                                                 data_attr['description'] + ' ' + merge_check_element[0][6],
+                                                 final_duration,
+                                                 data_attr['incident_logo'], data_attr['agency_logo'],
+                                                 data_attr['address'], data_attr['city'], data_attr['state'],
+                                                 data_attr['address_2'],
+                                                 data_attr['business'], data_attr['longitude'], data_attr['latitude'],
+                                                 data_attr['property_value']))
+
+                # for elem in data_contents_update:
+                #     if (elem[1] == data_attr['title'] and elem[2] == data_attr['agency'] and elem[3] == data_attr['location'] and elem[5] == data_attr.get('date_of_incident')):
+                #         break
+                # else:
+                #     data_contents_update.append(data_tuple_update)
+
+                """check for active incident turned to recent"""
+
+            elif len(id_to_update) > 0:
+                print("active incident turned to recent")
+                # data_tuple_update = (id_to_update[0][17],
+                #                      data_attr['type'], data_attr['title'], data_attr['agency'], data_attr['location'],
+                #                      data_attr['timestamp_time'],
+                #                      data_attr['date_of_incident'], data_attr['description'], data_attr['duration'],
+                #                      data_attr['incident_logo'], data_attr['agency_logo'],
+                #                      data_attr['address'], data_attr['city'], data_attr['state'], data_attr['address_2'],
+                #                      data_attr['business'],data_attr['longitude'], data_attr['latitude'])
+                agency = data_attr['agency']
+                for elem in data_contents_update:
+                    if (elem[1] == data_attr['title'] and elem[3] == data_attr['location'] and elem[5] == data_attr.get(
+                            'date_of_incident')):
+                        if (elem[2] != agency):
+                            data_attr['agency'] = data_attr['agency'] + "," + elem[2]
+                        else:
+                            continue
+                        break
+                else:
+                    data_contents_update.append((id_to_update[0][18], data_attr['type'], data_attr['title'],
+                                                 data_attr['agency'], data_attr['location'],
+                                                 data_attr['timestamp_time'],
+                                                 data_attr['date_of_incident'], data_attr['description'],
+                                                 data_attr['duration'],
+                                                 data_attr['incident_logo'], data_attr['agency_logo'],
+                                                 data_attr['address'], data_attr['city'], data_attr['state'],
+                                                 data_attr['address_2'],
+                                                 data_attr['business'], data_attr['longitude'], data_attr['latitude'],
+                                                 data_attr['property_value']))
+
+                # for elem in data_contents_update:
+                #     if (elem[1] == data_attr['title'] and elem[2] == data_attr['agency'] and elem[3] == data_attr['location'] and elem[5] == data_attr.get('date_of_incident')):
+                #         break
+                # else:
+                #     data_contents_update.append(data_tuple_update)
+            else:
+                # print("append insert list", len(data_contents_insert))
+                # data_tuple_insert = (data_attr['type'], data_attr['title'], data_attr['agency'], data_attr['location'],
+                #                      data_attr['timestamp_time'],
+                #                      data_attr['date_of_incident'], data_attr['description'], data_attr['duration'],
+                #                      data_attr['incident_logo'], data_attr['agency_logo'],
+                #                      data_attr['address'], data_attr['city'], data_attr['state'], data_attr['address_2'],
+                #                      data_attr['business'], data_attr['longitude'], data_attr['latitude'])
+                agency = data_attr['agency']
+                for elem in data_contents_insert:
+                    if (elem[1] == data_attr['title'] and elem[3] == data_attr['location'] and elem[5] == data_attr.get(
+                            'date_of_incident')):
+                        if (elem[2] != agency):
+                            data_attr['agency'] = data_attr['agency'] + "," + elem[2]
+                        else:
+                            continue
+                        break
+                else:
+                    # data_contents_insert.append((data_attr['type'], data_attr['title'], data_attr['agency'], data_attr['location'],
+                    #                  data_attr['timestamp_time'],
+                    #                  data_attr['date_of_incident'], data_attr['description'], data_attr['duration'],
+                    #                  data_attr['incident_logo'], data_attr['agency_logo'],
+                    #                  data_attr['address'], data_attr['city'], data_attr['state'], data_attr['address_2'],
+                    #                  data_attr['business'], data_attr['longitude'], data_attr['latitude']))
+
+                    for elem in data_contents_insert:
+                        # print('check #####################################################################',elem[5] == data_attr.get('date_of_incident'))
+                        if (elem[1] == data_attr['title'] and elem[2] == data_attr['agency'] and elem[3] == data_attr[
+                            'location'] and elem[5] == data_attr.get('date_of_incident')):
+                            # print('duplicate found...#######################')
+                            break
+                    else:
+                        data_contents_insert.append(
+                            (data_attr['type'], data_attr['title'], data_attr['agency'], data_attr['location'],
+                             data_attr['timestamp_time'],
+                             data_attr['date_of_incident'], data_attr['description'], data_attr['duration'],
+                             data_attr['incident_logo'], data_attr['agency_logo'],
+                             data_attr['address'], data_attr['city'], data_attr['state'], data_attr['address_2'],
+                             data_attr['business'], data_attr['longitude'], data_attr['latitude'],
+                             data_attr['property_value']))
+
+                # for elem in data_contents_insert:
+                #     # print('check #####################################################################',elem[5] == data_attr.get('date_of_incident'))
+                #     if (elem[1] == data_attr['title'] and elem[2] == data_attr['agency'] and elem[3] == data_attr['location'] and elem[5] == data_attr.get('date_of_incident')):
+                #         # print('duplicate found...#######################')
+                #         break
+                # else:
+                #     data_contents_insert.append(data_tuple_insert)
+
+    """
+    to insert new incidents
+    """
+    # print(data_contents_insert, )
+    data_tuples_insert = tuple(data_contents_insert)
+    print('Updated Length of incidents to insert', len(data_tuples_insert))
+    if len(data_tuples_insert) > 0:
+        # print('populating into db...')
+        args_str = b','.join(
+            cur_insert.mogrify("(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", x) for x in
+            data_tuples_insert)
+        try:
+            cur_insert.execute(b"INSERT INTO incidents VALUES " + args_str)
+            conn.commit()
+            print(cur_insert.rowcount, "Record inserted successfully into  table")
+        except (Exception, psycopg2.DatabaseError) as error:
+            print(error)
+
+    """
+    to update active to recent incident 
+    """
+    # data_tuples_update = tuple(data_contents_update)
+    print('Updated Length of incidents active to recent  : ', len(data_contents_update))
+
+    if len(data_contents_update) > 0:
+        print('updating................................................')
+
+        # update only type (active to recent) and duration of the incident
+
+        # update_query = """UPDATE incidents
+        #                    SET type = update_payload.type,
+        #                    duration = update_payload.duration
+        #                    FROM (VALUES %s) AS update_payload (id,type, duration)
+        #                    WHERE incidents.id = update_payload.id"""
+        #
+
+        # to update all the fields  , use this instead
+        update_query = """UPDATE incidents
+                           SET type = update_payload.type,
+                            title = update_payload.title,
+                            agency = update_payload.agency,
+                            location = update_payload.location,
+                            timestamp_time = update_payload.timestamp_time,
+                            date_of_incident = update_payload.date_of_incident,
+                            description = update_payload.description,
+                            duration = update_payload.duration,
+                            incident_logo = update_payload.incident_logo,
+                            agency_logo = update_payload.agency_logo,
+                            address = update_payload.address,
+                            city = update_payload.city,
+                            state = update_payload.state,
+                            address_2 = update_payload.address_2,
+                            business = update_payload.business,
+                            longitude = update_payload.longitude, 
+                            latitude = update_payload.latitude,
+                            property_value = update_payload.property_value
+                           FROM (VALUES %s) AS update_payload (id, type,title,agency,location,timestamp_time,
+                           date_of_incident,description,duration,incident_logo,agency_logo,address,city,state,address_2,business,longitude,latitude,property_value)
+                           WHERE incidents.id = update_payload.id"""
+
+        # print('update_query ======================== ', update_query)
+
+        try:
+            execute_values(cur_update, update_query, data_contents_update)
+            conn.commit()
+            print(cur_update.rowcount, "Record updated successfully into  table")
+        except (Exception, psycopg2.DatabaseError) as error:
+            print(error)
+
+
+def check_agency():
+    driver = webdriver.Chrome(
+        executable_path=CHROME_DRIVER_PATH,
+        options=chrome_options,
+    )
+
+    # timeout
+    wait = WebDriverWait(driver, 30)
+    driver.get(url=URL_PULSEPOINT)
+    print('init...')
+    time.sleep(0.5)
+    cur_insert, cur_update, conn = connect()
+
+    try:
+        # wait for visibility of product result section
+        # wait.until(EC.presence_of_element_located((By.ID, "pp_wa_navbar_search_button")))
+        wait.until(EC.presence_of_element_located((By.CLASS_NAME, "dhxcombolist_material")))
+    except TimeoutException as e:
+        print("Wait Timed out")
+        print(e)
+    except NoSuchElementException as ne:
+        print("No such element")
+        print(ne)
+    time.sleep(5)
+    len_agency = len(driver.find_elements_by_xpath("/html/body/div[2]/div"))
+    driver.close()
+    return len_agency
+
+
+def scraper_main(li_instance):
+    start = timeit.default_timer()
+
+    start_ins, end_ins = li_instance
+
+    driver = webdriver.Chrome(
+        executable_path=CHROME_DRIVER_PATH,
+        options=chrome_options,
+    )
+
+    # timeout
+    wait = WebDriverWait(driver, 30)
+    driver.get(url=URL_PULSEPOINT)
+    print('init...')
+    time.sleep(0.5)
+    cur_insert, cur_update, conn = connect()
+
+    try:
+        # wait for visibility of product result section
+        # wait.until(EC.presence_of_element_located((By.ID, "pp_wa_navbar_search_button")))
+        wait.until(EC.presence_of_element_located((By.CLASS_NAME, "dhxcombolist_material")))
+    except TimeoutException as e:
+        print("Wait Timed out")
+        print(e)
+    except NoSuchElementException as ne:
+        print("No such element")
+        print(ne)
+    time.sleep(5)
+    drop_down_agency = driver.find_element_by_xpath("/html/body/div[5]/div/div[1]/div[1]")
+    drop_down_incident_types = driver.find_element_by_xpath("/html/body/div[5]/div/div[2]/div[1]")
+    li_drop_down_incident_types = ['/html/body/div[1]/div[6]',
+                                   '/html/body/div[1]/div[12]',
+                                   '/html/body/div[1]/div[13]',
+                                   '/html/body/div[1]/div[19]',
+                                   '/html/body/div[1]/div[20]',
+                                   '/html/body/div[1]/div[27]',
+                                   '/html/body/div[1]/div[30]',
+                                   '/html/body/div[1]/div[48]',
+                                   '/html/body/div[1]/div[58]',
+                                   '/html/body/div[1]/div[63]',
+                                   '/html/body/div[1]/div[88]',
+                                   '/html/body/div[1]/div[93]',
+                                   '/html/body/div[1]/div[94]',
+                                   '/html/body/div[1]/div[70]',
+                                   '/html/body/div[1]/div[33]']
+
+    for incident_type in li_drop_down_incident_types:
+        drop_down_incident_types.click()
+        driver.find_element_by_xpath(incident_type).click()
+        time.sleep(0.3)
+
+    agency_counter = start_ins
+    agency_iterator = 15
+    time.sleep(0.5)
+    while agency_counter <= end_ins:
+        print(f'Agency Counter : From {agency_counter} to {agency_counter + agency_iterator}')
+        for i in range(agency_counter, agency_counter + agency_iterator):
+            drop_down_agency.click()
+            try:
+                driver.find_element_by_xpath("/html/body/div[2]/div" + "[" + str(i) + "]").click()
+            except TimeoutException as e:
+                print("Wait Timed out")
+                print(e)
+            except NoSuchElementException as ne:
+                print("No such element")
+                print(ne)
+            except ElementClickInterceptedException as ece:
+                print("element is not clickable")
+                print(ece)
+            time.sleep(0.3)
+
+        # driver.execute_script("window.scrollTo(0, document.body.scrollHeight+200);")
+        # html = driver.find_element_by_tag_name('html')
+        # html.send_keys(Keys.PAGE_DOWN)
+
+        """find the button to display incidents"""
+        try:
+            element = driver.find_element_by_xpath("/html/body/div[5]/div/button")
+            var = element.location_once_scrolled_into_view
+            print(var)
+        except TimeoutException as e:
+            print("Wait Timed out")
+            print(e)
+        except NoSuchElementException as ne:
+            print("No such element")
+            print(ne)
+
+        """click to find incidents"""
+        try:
+            # driver.find_element_by_class_name('pp_wa_large_button').click()
+            driver.find_element_by_xpath('/html/body/div[5]/div/button').click()
+        except TimeoutException as e:
+            print("Wait Timed out")
+            print(e)
+        except NoSuchElementException as ne:
+            print("No such element")
+            print(ne)
+        except ElementClickInterceptedException as ece:
+            print("element is not clickable")
+            print(ece)
+
+        try:
+            # wait for visibility of product result section
+            # wait.until(EC.presence_of_element_located((By.ID, "pp_wa_navbar_search_button")))
+            wait.until(EC.presence_of_element_located((By.CLASS_NAME, "pp_wa_tabs")))
+        except TimeoutException as e:
+            print("Wait Timed out")
+            print(e)
+        except NoSuchElementException as ne:
+            print("No such element")
+            print(ne)
+        time.sleep(5)
+        incident_element = None
+
+        """incident info element"""
+        try:
+            incident_element = driver.find_element_by_class_name('pp_wa_incident_content').get_attribute(
+                'innerHTML')
+        except TimeoutException as e:
+            print("Wait Timed out")
+            print(e)
+        except NoSuchElementException as ne:
+            print("No such element")
+            print(ne)
+        time.sleep(1)
+
+        """attr crawling start"""
+        soup = BeautifulSoup(incident_element, 'html.parser')
+
+        """ parse recent incidents"""
+        try:
+            # print(soup.select("section#recent_incidents_content h3.pp_no_incident_text"))
+            if len(soup.select("section#recent_incidents_content h3.pp_no_incident_text")) == 1:
+                print('No recent incident',
+                      len(soup.select("section#recent_incidents_content h3.pp_no_incident_text")))
+            else:
+                recent_incident_contents = soup.select(
+                    "section#recent_incidents_content dd.pp_incident_item_dd div.pp_incident_item_container")
+                get_data_attr(recent_incident_contents, 'recent', cur_insert, cur_update, conn)
+
+        except Exception as e:
+            print(e)
+
+        """ parse active incidents"""
+        try:
+            # print(soup.select("section#active_incidents_content h3.pp_no_incident_text"))
+            if len(soup.select("section#active_incidents_content h3.pp_no_incident_text")) == 1:
+                print('No active incident',
+                      len(soup.select("section#recent_incidents_content h3.pp_no_incident_text")))
+            else:
+                active_incident_contents = soup.select(
+                    "section#active_incidents_content dd.pp_incident_item_dd div.pp_incident_item_container")
+                get_data_attr(active_incident_contents, 'active', cur_insert, cur_update, conn)
+
+        except Exception as e:
+            print(e)
+
+        """click to show side bar"""
+        try:
+            driver.find_element_by_xpath('/html/body/div[3]/div').click()
+        except TimeoutException as e:
+            print("Wait Timed out")
+            print(e)
+        except NoSuchElementException as ne:
+            print("No such element")
+            print(ne)
+        except ElementClickInterceptedException as ece:
+            print("element is not clickable")
+            print(ece)
+        time.sleep(1)
+
+        """clear previously selected agencies"""
+        try:
+            driver.find_element_by_xpath('/html/body/div[5]/div/div[1]/button').click()
+        except TimeoutException as e:
+            print("Wait Timed out")
+            print(e)
+        except NoSuchElementException as ne:
+            print("No such element")
+            print(ne)
+        except ElementClickInterceptedException as ece:
+            print("element is not clickable")
+            print(ece)
+        except ElementNotInteractableException as eni:
+            print(eni)
+            print('End of agency list...')
+            break
+
+        agency_counter = agency_counter + agency_iterator
+        time.sleep(1)
+
+    # close connection and cursor
+    print('close db connection')
+    cur_insert.close()
+    cur_update.close()
+    conn.close()
+
+    driver.close()
+    driver.quit()
+
+    stop = timeit.default_timer()
+    print('Time: ', stop - start)
+
+
+def run_all(li_instance):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        executor.map(scraper_main, li_instance)
+
+
+def main_func():
+    agency_divider = 10
+    agency_count = check_agency()
+    instance_number, remainder = divmod(agency_count, agency_divider)
+    print(f'Total Agency: {agency_count}, Agency interval: {instance_number}')
+    print(instance_number, remainder)
+
+    total_li = []
+    start = 1
+    for i in range(1, agency_divider + 1):
+        end = start + instance_number
+        total_li.append([start, end - 1])
+        start = end
+    else:
+        if not remainder == 0:
+            total_li.append([end, end + remainder - 1])
+    print(total_li)
+
+    start_time = time.time()
+    run_all(total_li)
+    # run_all([[605,610],[80,85]])
+    duration = time.time() - start_time
+    print(f"Scraped {len(total_li)} in {duration} seconds")
+
+
+main_func()

@@ -1,0 +1,56 @@
+FROM --platform=linux/amd64 python:3.9-slim-buster
+
+## Install dependencies
+#RUN apt-get update && \
+#    apt-get install -y tor privoxy && \
+#    rm -rf /var/lib/apt/lists/*
+
+
+# Install dependencies
+RUN apt-get update && \
+    apt-get install -y gnupg2 wget xvfb unzip tor libnss3 && \
+    rm -rf /var/lib/apt/lists/*
+
+
+# Download and install Google Chrome
+RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - && \
+    echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list && \
+    apt-get update && \
+    apt-get install -y google-chrome-stable
+#RUN apt-get install -y chromium
+#RUN wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+#RUN dpkg -i google-chrome-stable_current_amd64.deb; apt-get -fy install
+
+# set display port to avoid crash
+ENV DISPLAY=:99
+
+# Configure Tor
+RUN echo "SOCKSPort 0.0.0.0:9050" >> /etc/tor/torrc && \
+    echo "ExitPolicy reject *:*" >> /etc/tor/torrc
+
+# Configure Privoxy
+#RUN sed -i 's/listen-address  127.0.0.1:8118/listen-address  0.0.0.0:8119/g' /etc/privoxy/config
+
+# Expose ports
+EXPOSE 9050
+#EXPOSE 8119
+
+# Set working directory
+WORKDIR /app
+
+# Copy requirements file
+COPY requirements.txt .
+
+# Install requirements
+RUN pip install -r requirements.txt --upgrade
+
+# Copy source code
+COPY . .
+
+# Run the command
+#CMD service tor start && \
+#    service privoxy start && \
+#    python cron_run.py
+
+CMD service tor start && \
+    python cron_run.py
